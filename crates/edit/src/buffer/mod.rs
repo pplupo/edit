@@ -670,11 +670,19 @@ impl TextBuffer {
             // Recalculate the line statistics.
             if self.word_wrap_column > 0 {
                 let end = self.cursor_move_to_logical_internal(self.cursor, Point::MAX);
-                self.stats.visual_lines = end.visual_pos.y + 1;
+                self.stats.visual_lines =
+                    end.visual_pos.y + 1 + self.ends_at_wrap_column(&end) as CoordType;
             } else {
                 self.stats.visual_lines = self.stats.logical_lines;
             }
         }
+    }
+
+    /// Whether a cursor at the end of the document sits exactly on the word wrap
+    /// column, which makes `render()` draw it on a phantom row below the text.
+    /// `stats.visual_lines` has to include that row as well.
+    fn ends_at_wrap_column(&self, end: &Cursor) -> bool {
+        self.word_wrap_column > 0 && end.visual_pos.x >= self.word_wrap_column
     }
 
     /// Replaces the entire buffer contents with the given `text`.
@@ -1643,6 +1651,12 @@ impl TextBuffer {
             cursor = self.goto_line_start(cursor, cursor.logical_pos.y - 1);
         }
 
+        // See `cursor_move_to_logical_internal()`: with word-wrap enabled, forward seeks
+        // start from the line start so that they don't depend on where the cursor came from.
+        if self.word_wrap_column > 0 && offset > cursor.offset {
+            cursor = self.goto_line_start(cursor, cursor.logical_pos.y);
+        }
+
         self.measurement_config().with_cursor(cursor).goto_offset(offset)
     }
 
@@ -1656,7 +1670,14 @@ impl TextBuffer {
         // goto_line_start() is the fastest way for seeking across lines. As such we always
         // use it if the requested `.y` position is different. We still need to use it if the
         // `.x` position is smaller, but only because `goto_logical()` cannot seek backwards.
-        if pos.y != cursor.logical_pos.y || pos.x < cursor.logical_pos.x {
+        //
+        // With word-wrap enabled it's used for forward seeks as well, because
+        // `measure_forward()` continues from the cursor's own visual position and wrap
+        // state: the result would otherwise depend on how the cursor got where it is.
+        if self.word_wrap_column > 0
+            || pos.y != cursor.logical_pos.y
+            || pos.x < cursor.logical_pos.x
+        {
             cursor = self.goto_line_start(cursor, pos.y);
         }
 
@@ -3100,7 +3121,8 @@ impl TextBuffer {
             let end = self.goto_line_start(cursor, cursor.logical_pos.y + 1);
             ActiveEditLineInfo {
                 safe_start,
-                height_before: end.visual_pos.y - safe_start.visual_pos.y,
+                height_before: end.visual_pos.y - safe_start.visual_pos.y
+                    + self.ends_at_wrap_column(&end) as CoordType,
                 end_offset: end.offset,
             }
         });
@@ -3113,7 +3135,8 @@ impl TextBuffer {
                 removed_end,
                 Point { x: 0, y: removed_end.logical_pos.y + 1 },
             );
-            info.height_before += new_end.visual_pos.y - old_end.visual_pos.y;
+            info.height_before += new_end.visual_pos.y - old_end.visual_pos.y
+                + self.ends_at_wrap_column(&new_end) as CoordType;
             info.end_offset = new_end.offset;
         }
 
@@ -3142,8 +3165,10 @@ impl TextBuffer {
         let anchor =
             if self.cursor.offset <= info.end_offset { self.cursor } else { info.safe_start };
         let end = self.cursor_move_to_offset_internal(anchor, info.end_offset);
-        let height_after = end.visual_pos.y - info.safe_start.visual_pos.y;
+        let height_after = end.visual_pos.y - info.safe_start.visual_pos.y
+            + self.ends_at_wrap_column(&end) as CoordType;
         self.stats.visual_lines += height_after - info.height_before;
+        self.set_cursor_internal(self.cursor);
     }
 
     /// Undo the last edit operation.
@@ -3491,6 +3516,15 @@ mod tests {
         innert(text.as_ref())
     }
 
+    /// Creates an empty buffer with word-wrap enabled at a column of 6 and no margin.
+    fn word_wrapped_buffer() -> TextBuffer {
+        let mut buf = TextBuffer::new(false).unwrap();
+        buf.set_margin_enabled(false);
+        buf.set_word_wrap(true);
+        buf.set_width(6);
+        buf
+    }
+
     fn buffer_stored_bytes(buf: &TextBuffer) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(buf.text_length());
         while let chunk = buf.read_forward(bytes.len())
@@ -3544,7 +3578,11 @@ mod tests {
 
         let end = config.clone().goto_logical(Point::MAX);
         assert_eq!(buf.logical_line_count(), end.logical_pos.y + 1, "logical line count");
-        assert_eq!(buf.visual_line_count(), end.visual_pos.y + 1, "visual line count");
+        assert_eq!(
+            buf.visual_line_count(),
+            end.visual_pos.y + 1 + buf.ends_at_wrap_column(&end) as CoordType,
+            "visual line count"
+        );
 
         let cursor = config.clone().goto_offset(buf.cursor_offset());
         assert_eq!(buf.cursor_offset(), cursor.offset, "cursor boundary");
@@ -4189,5 +4227,166 @@ mod tests {
         .unwrap();
 
         assert_eq!(buffer_stored_bytes(&buf), b"ax\nbx\nx\n");
+    }
+
+    #[test]
+    fn word_wrap_last_line_exact_fill() {
+        // Wrap column 6:
+        //   |text  |  <- row 0, wrap opportunity after the space
+        //   |`code`|  <- row 1, fills the column exactly
+        //   |      |  <- phantom row that the cursor wraps onto
+        let mut buf = word_wrapped_buffer();
+        buf.write_raw(b"text `code`");
+
+        // The cursor lands exactly on the word wrap column, so it needs a phantom row.
+        assert_eq!(buf.visual_line_count(), 3);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 6, y: 1 });
+    }
+
+    #[test]
+    fn word_wrap_phantom_row_on_typed_character() {
+        let mut buf = word_wrapped_buffer();
+
+        // "text " fills the first row and "`code" sits on the second: no phantom row.
+        buf.write_raw(b"text `code");
+        assert_eq!(buf.visual_line_count(), 2);
+
+        // Typing the closing backtick fills the last row ("`code`") exactly.
+        buf.write_raw(b"`");
+        assert_eq!(buf.visual_line_count(), 3);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 6, y: 1 });
+
+        // Backspacing the backtick removes the phantom row again.
+        // Layout is now: "text " / "`code", hence the cursor sits at x=5.
+        buf.delete(CursorMovement::Grapheme, -1);
+        assert_eq!(buf.visual_line_count(), 2);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 5, y: 1 });
+    }
+
+    #[test]
+    fn word_wrap_phantom_row_on_mid_line_edit() {
+        let mut buf = word_wrapped_buffer();
+        buf.write_raw(b"text `code");
+        assert_eq!(buf.visual_line_count(), 2);
+
+        // Inserting a character in the middle of the last line makes it end
+        // exactly on the wrap column ("text " / "X`code").
+        buf.cursor_move_to_logical(Point { x: 5, y: 0 });
+        buf.write_raw(b"X");
+        assert_eq!(buf.visual_line_count(), 3);
+
+        // Undo removes the phantom row again.
+        buf.undo();
+        assert_eq!(buf.visual_line_count(), 2);
+        buf.redo();
+        assert_eq!(buf.visual_line_count(), 3);
+
+        // Deleting the inserted character drops it as well.
+        buf.cursor_move_to_logical(Point { x: 6, y: 0 });
+        buf.delete(CursorMovement::Grapheme, -1);
+        assert_eq!(buf.visual_line_count(), 2);
+    }
+
+    #[test]
+    fn word_wrap_phantom_row_consumed_by_extra_wrap() {
+        let mut buf = word_wrapped_buffer();
+
+        // Exact fill on the last row ("text " / "`code`").
+        buf.write_raw(b"text `code`");
+        assert_eq!(buf.visual_line_count(), 3);
+
+        // Typing a space wraps it onto a third row ("text " / "`code`" / " "),
+        // which consumes the phantom row.
+        buf.write_raw(b" ");
+        assert_eq!(buf.visual_line_count(), 3);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 1, y: 2 });
+    }
+
+    #[test]
+    fn word_wrap_exact_fill_before_newline_has_no_phantom_row() {
+        let mut buf = word_wrapped_buffer();
+        buf.write_raw(b"abcdef\nghi");
+
+        // The first row is filled exactly, but the trailing newline resets
+        // the visual position, so no phantom row is added.
+        assert_eq!(buf.visual_line_count(), 2);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 3, y: 1 });
+    }
+
+    #[test]
+    fn word_wrap_short_last_line_has_no_phantom_row() {
+        let mut buf = word_wrapped_buffer();
+        buf.write_raw(b"abc");
+
+        assert_eq!(buf.visual_line_count(), 1);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 3, y: 0 });
+    }
+
+    /// The cursor has to sit on a row that `visual_line_count()` covers, no matter
+    /// where it's moved to, and moving it back and forth must be idempotent.
+    #[test]
+    fn word_wrap_cursor_stays_on_counted_rows() {
+        // Words after a run of non-ASCII characters, space separated words, inline
+        // code, and words that are wider than the row (which get hard wrapped
+        // instead of being moved as a whole).
+        let texts: &[&str] = &[
+            "你好aa",
+            "你好aa你",
+            "aa aa",
+            "aa aa a",
+            "text aaaa",
+            "text a",
+            "hello ``",
+            "text `code`",
+            "a b c d e f",
+            "0123456789",
+        ];
+
+        for text in texts {
+            let len = text.chars().count() as CoordType;
+
+            for width in 2..=14 {
+                let mut buf = TextBuffer::new(false).unwrap();
+                buf.set_margin_enabled(false);
+                buf.set_word_wrap(true);
+                buf.set_width(width);
+                buf.write_raw(text.as_bytes());
+
+                let visual_lines = buf.visual_line_count();
+                let assert_on_a_counted_row = |buf: &TextBuffer| {
+                    let pos = buf.cursor_visual_pos();
+                    assert!(
+                        pos.y < visual_lines,
+                        "cursor {pos:?} is outside the {} visual lines \
+                         (text {text:?}, width {width})",
+                        visual_lines
+                    );
+                };
+
+                // Walk left to the start of the document, remembering where the
+                // cursor was at every offset on the way.
+                let mut visited = Vec::new();
+                for _ in 0..len {
+                    visited.push(buf.cursor.visual_pos);
+                    buf.cursor_move_delta(CursorMovement::Grapheme, -1);
+                    assert_on_a_counted_row(&buf);
+                }
+
+                // Walking back right must visit the exact same positions again.
+                for step in 0..len {
+                    buf.cursor_move_delta(CursorMovement::Grapheme, 1);
+                    assert_on_a_counted_row(&buf);
+
+                    let expected = visited[len as usize - step as usize - 1];
+                    assert_eq!(
+                        buf.cursor_visual_pos(),
+                        expected,
+                        "moving right to offset {} disagrees with moving left \
+                         (text {text:?}, width {width})",
+                        step + 1
+                    );
+                }
+            }
+        }
     }
 }
